@@ -1,62 +1,51 @@
- 
-const express = require('express');
+﻿const express = require('express');
 const multer = require('multer');
 const path = require('path');
+const os = require('os');
 const fs = require('fs');
 
 const extractPDFText = require('../utils/pdfExtractor');
 const splitText = require('../utils/textChunker');
 const vectorStore = require('../utils/vectorStore');
+const supabase = require('../utils/supabaseClient');
 
 const router = express.Router();
-const uploadsDir = path.join(__dirname, '..', 'uploads');
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadsDir);
-  },
-  filename: (req, file, cb) => {
-    const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
-    cb(null, `${Date.now()}-${safeName}`);
-  }
-});
-
-const fileFilter = (req, file, cb) => {
-  if (
-    file.mimetype === 'application/pdf' &&
-    path.extname(file.originalname).toLowerCase() === '.pdf'
-  ) {
-    cb(null, true);
-  } else {
-    cb(new Error('Only PDF files are allowed!'));
-  }
-};
+const bucket = process.env.SUPABASE_STORAGE_BUCKET;
 
 const upload = multer({
-  storage,
-  fileFilter,
-  limits: { fileSize: 10 * 1024 * 1024 }
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (
+      file.mimetype === 'application/pdf' &&
+      path.extname(file.originalname).toLowerCase() === '.pdf'
+    ) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF files are allowed!'));
+    }
+  }
 });
 
-// Get uploaded PDF documents
+// List PDFs stored in Supabase Storage
 router.get('/documents', async (req, res) => {
   try {
-    const files = await fs.promises.readdir(uploadsDir);
+    const { data, error } = await supabase.storage
+      .from(bucket)
+      .list('', {
+        limit: 100,
+        sortBy: { column: 'created_at', order: 'desc' }
+      });
 
-    const documents = await Promise.all(
-      files
-        .filter((filename) => filename.toLowerCase().endsWith('.pdf'))
-        .map(async (filename) => {
-          const filePath = path.join(uploadsDir, filename);
-          const stats = await fs.promises.stat(filePath);
+    if (error) throw error;
 
-          return {
-            filename,
-            size: stats.size,
-            uploadedAt: stats.birthtime
-          };
-        })
-    );
+    const documents = (data || [])
+      .filter((file) => file.name.toLowerCase().endsWith('.pdf'))
+      .map((file) => ({
+        filename: file.name,
+        size: file.metadata?.size || 0,
+        uploadedAt: file.created_at
+      }));
 
     res.status(200).json({ documents });
   } catch (error) {
@@ -67,6 +56,10 @@ router.get('/documents', async (req, res) => {
 
 // Upload PDF
 router.post('/pdf', upload.single('pdf'), async (req, res) => {
+  let tempPath;
+  let storageUploaded = false;
+  let filename;
+
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -74,10 +67,15 @@ router.post('/pdf', upload.single('pdf'), async (req, res) => {
       });
     }
 
-    const extractedText = await extractPDFText(req.file.path);
+    const safeName = req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+    filename = `${Date.now()}-${safeName}`;
+
+    tempPath = path.join(os.tmpdir(), filename);
+    await fs.promises.writeFile(tempPath, req.file.buffer);
+
+    const extractedText = await extractPDFText(tempPath);
 
     if (!extractedText.trim()) {
-      await fs.promises.unlink(req.file.path);
       return res.status(400).json({
         message: 'No readable text found in this PDF.'
       });
@@ -85,10 +83,21 @@ router.post('/pdf', upload.single('pdf'), async (req, res) => {
 
     const chunks = await splitText(extractedText);
 
+    const { error: storageError } = await supabase.storage
+      .from(bucket)
+      .upload(filename, req.file.buffer, {
+        contentType: 'application/pdf',
+        upsert: false
+      });
+
+    if (storageError) throw storageError;
+
+    storageUploaded = true;
+
     const documents = chunks.map((chunk, index) => ({
       pageContent: chunk,
       metadata: {
-        source: req.file.filename,
+        source: filename,
         chunkIndex: index
       }
     }));
@@ -97,21 +106,29 @@ router.post('/pdf', upload.single('pdf'), async (req, res) => {
 
     res.status(201).json({
       message: 'PDF uploaded and stored successfully!',
-      filename: req.file.filename,
+      filename,
       size: req.file.size,
       chunkCount: chunks.length
     });
   } catch (error) {
     console.error('PDF processing error:', error);
 
+    if (storageUploaded && filename) {
+      await supabase.storage.from(bucket).remove([filename]);
+    }
+
     res.status(500).json({
       message: 'PDF processing failed.',
       error: error.message
     });
+  } finally {
+    if (tempPath) {
+      await fs.promises.unlink(tempPath).catch(() => {});
+    }
   }
 });
 
-// Delete PDF and its ChromaDB chunks
+// Delete PDF and its vector chunks
 router.delete('/documents/:filename', async (req, res) => {
   try {
     const { filename } = req.params;
@@ -125,9 +142,13 @@ router.delete('/documents/:filename', async (req, res) => {
       });
     }
 
-    const filePath = path.join(uploadsDir, filename);
+    const { data: files, error: listError } = await supabase.storage
+      .from(bucket)
+      .list('', { search: filename });
 
-    if (!fs.existsSync(filePath)) {
+    if (listError) throw listError;
+
+    if (!files || !files.some((file) => file.name === filename)) {
       return res.status(404).json({
         message: 'PDF document not found.'
       });
@@ -137,7 +158,11 @@ router.delete('/documents/:filename', async (req, res) => {
       filter: { source: filename }
     });
 
-    await fs.promises.unlink(filePath);
+    const { error: storageError } = await supabase.storage
+      .from(bucket)
+      .remove([filename]);
+
+    if (storageError) throw storageError;
 
     res.status(200).json({
       message: 'PDF and its stored document chunks deleted successfully.',
@@ -154,4 +179,3 @@ router.delete('/documents/:filename', async (req, res) => {
 });
 
 module.exports = router;
-

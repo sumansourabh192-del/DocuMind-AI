@@ -1,4 +1,4 @@
-﻿import { useState, useEffect } from 'react'
+import { useState, useEffect } from 'react'
 import {
   FileText,
   MessageSquare,
@@ -14,6 +14,8 @@ import {
   Menu,
 } from 'lucide-react'
 
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000'
+
 function App() {
   const [file, setFile] = useState(null)
   const [message, setMessage] = useState('')
@@ -26,7 +28,7 @@ function App() {
   useEffect(() => {
     const restoreLatestPDF = async () => {
       try {
-        const response = await fetch('http://localhost:5000/api/upload/documents')
+        const response = await fetch(`${API_URL}/api/upload/documents`)
         const data = await response.json(); console.log('DOCUMIND CHAT RESPONSE:', data)
 
         if (response.ok && data.documents?.length > 0) {
@@ -76,7 +78,7 @@ function App() {
     try {
       setUploading(true)
 
-      const response = await fetch('http://localhost:5000/api/upload/pdf', {
+      const response = await fetch(`${API_URL}/api/upload/pdf`, {
         method: 'POST',
         body: formData,
       })
@@ -117,7 +119,7 @@ function App() {
     try {
       setLoading(true)
 
-      const response = await fetch('http://localhost:5000/api/chat', {
+      const response = await fetch(`${API_URL}/api/chat`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -417,19 +419,3 @@ function App() {
 }
 
 export default App
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
